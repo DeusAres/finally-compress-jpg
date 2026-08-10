@@ -1,6 +1,6 @@
 <!--
   densitor — batch JPEG compressor (jpegli/WASM)
-  APP VERSION: 1.4.0
+  APP VERSION: 1.5.0
   Bump this + the on-page footer version whenever behavior changes:
     - 1.0.0  initial batch UI, worker pool, ZIP export
     - 1.1.0  per-file engine badge (jpegli/fallback), memory-safe decode queue
@@ -9,6 +9,8 @@
     - 1.4.0  EXIF/ICC/IPTC/Adobe metadata extracted from source and re-spliced
              into the re-encoded JPEG; forces imageOrientation:'none' on
              decode so the copied Orientation tag doesn't double-rotate
+    - 1.5.0  "Scarica singoli" option alongside ZIP: staggered individual
+             downloads sharing the same de-duplicated filename logic
 -->
 <!DOCTYPE html>
 <html lang="it">
@@ -337,6 +339,7 @@
     color: var(--text-faint);
   }
   .actionbar .status .hi{ color: var(--text); }
+  .dl-actions{ display:flex; align-items:center; gap: 10px; }
 
   .warn-banner{
     display:none;
@@ -424,7 +427,10 @@
 
   <div class="actionbar">
     <div class="status" id="statusText">Nessun file in coda</div>
-    <button class="btn btn-primary" id="zipBtn" type="button" disabled>Scarica ZIP</button>
+    <div class="dl-actions">
+      <button class="btn btn-ghost" id="dlAllBtn" type="button" disabled>Scarica singoli</button>
+      <button class="btn btn-primary" id="zipBtn" type="button" disabled>Scarica ZIP</button>
+    </div>
   </div>
 
   <div class="foot-note">
@@ -467,7 +473,7 @@ else if (typeof exports === 'object')
 
   // Bump this on any behavior/UX change. Mirrored in the HTML comment header
   // at the top of the file and shown in the UI (title + footer).
-  const APP_VERSION = "1.4.0";
+  const APP_VERSION = "1.5.0";
   document.getElementById('appVersionTag').textContent = 'v' + APP_VERSION;
   document.getElementById('appVersionFoot').textContent = 'densitor v' + APP_VERSION;
 
@@ -690,6 +696,7 @@ function getJpegliModule(){
   const fileList = document.getElementById('fileList');
   const statusText = document.getElementById('statusText');
   const zipBtn = document.getElementById('zipBtn');
+  const dlAllBtn = document.getElementById('dlAllBtn');
   const resetBtn = document.getElementById('resetBtn');
   const totalSavedEl = document.getElementById('totalSaved');
   const qualitySlider = document.getElementById('qualitySlider');
@@ -875,6 +882,29 @@ function getJpegliModule(){
         (processing > 0 ? '' : ' — pronto') + engineNote;
     }
     zipBtn.disabled = done === 0 || processing > 0;
+    dlAllBtn.disabled = done === 0 || processing > 0;
+  }
+
+  function computeUniqueNames(items){
+    const usedNames = new Set();
+    return items.map(item => {
+      const base = item.name.replace(/\.jpe?g$/i, '') + '.jpg';
+      let final = base, n = 1;
+      while (usedNames.has(final)){ final = base.replace(/\.jpg$/, `-${n}.jpg`); n++; }
+      usedNames.add(final);
+      return { item, filename: final };
+    });
+  }
+
+  function triggerDownload(blob, filename){
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
   }
 
   resetBtn.addEventListener('click', () => {
@@ -896,27 +926,33 @@ function getJpegliModule(){
     zipBtn.textContent = 'Preparo ZIP…';
     try {
       const zip = new JSZip();
-      const usedNames = new Set();
-      done.forEach(item => {
-        let name = item.name.replace(/\.jpe?g$/i, '') + '.jpg';
-        let final = name, n = 1;
-        while (usedNames.has(final)){ final = name.replace(/\.jpg$/, `-${n}.jpg`); n++; }
-        usedNames.add(final);
-        zip.file(final, item.resultBytes);
-      });
+      computeUniqueNames(done).forEach(({ item, filename }) => zip.file(filename, item.resultBytes));
       const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 1 } });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'jpeg-compressi.zip';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      triggerDownload(blob, 'jpeg-compressi.zip');
     } finally {
       zipBtn.textContent = 'Scarica ZIP';
       updateStatus();
     }
+  });
+
+  // Individual downloads instead of a ZIP. Browsers throttle/ask permission
+  // for many near-simultaneous downloads triggered from one click, so these
+  // are staggered rather than fired all at once.
+  dlAllBtn.addEventListener('click', async () => {
+    const done = state.items.filter(i => i.status === 'done' && i.resultBytes);
+    if (done.length === 0) return;
+    dlAllBtn.disabled = true;
+    const named = computeUniqueNames(done);
+    const STAGGER_MS = 250;
+    for (let i = 0; i < named.length; i++){
+      const { item, filename } = named[i];
+      dlAllBtn.textContent = `Scarico ${i + 1}/${named.length}…`;
+      const blob = new Blob([item.resultBytes], { type: 'image/jpeg' });
+      triggerDownload(blob, filename);
+      if (i < named.length - 1) await new Promise(r => setTimeout(r, STAGGER_MS));
+    }
+    dlAllBtn.textContent = 'Scarica singoli';
+    updateStatus();
   });
 
 })();
