@@ -1,3 +1,11 @@
+<!--
+  densitor — batch JPEG compressor (jpegli/WASM)
+  APP VERSION: 1.2.0
+  Bump this + the on-page footer version whenever behavior changes:
+    - 1.0.0  initial batch UI, worker pool, ZIP export
+    - 1.1.0  per-file engine badge (jpegli/fallback), memory-safe decode queue
+    - 1.2.0  decode moved into worker, worker recycling, dropped redundant copy
+-->
 <!DOCTYPE html>
 <html lang="it">
 <head>
@@ -203,7 +211,7 @@
   .frow{
     background: var(--bg-raised);
     display: grid;
-    grid-template-columns: 1fr auto auto auto 110px;
+    grid-template-columns: 1fr auto auto auto auto 110px;
     align-items: center;
     gap: 16px;
     padding: 12px 18px;
@@ -215,6 +223,18 @@
     white-space: nowrap;
     color: var(--text);
   }
+  .fengine{
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+    padding: 2px 7px;
+    border-radius: 4px;
+    white-space: nowrap;
+    border: 1px solid transparent;
+  }
+  .fengine.jpegli{ color: var(--teal); border-color: #5fada44d; background: #5fada41a; }
+  .fengine.fallback{ color: var(--amber); border-color: #e6a13c4d; background: #e6a13c1a; }
+  .fengine.pending{ color: var(--text-faint); }
   .frow .fsize{
     font-family: var(--mono);
     color: var(--text-faint);
@@ -270,6 +290,21 @@
   }
   .actionbar .status .hi{ color: var(--text); }
 
+  .warn-banner{
+    display:none;
+    align-items:center;
+    gap:10px;
+    background: #e6a13c14;
+    border: 1px solid #e6a13c4d;
+    color: var(--amber);
+    font-size: 12.5px;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    font-family: var(--mono);
+  }
+  .warn-banner.show{ display:flex; }
+
   .foot-note{
     margin-top: 40px;
     padding-top: 20px;
@@ -283,7 +318,7 @@
 
   @media (max-width: 600px){
     .frow{ grid-template-columns: 1fr auto; row-gap: 6px; }
-    .frow .fsize, .frow .farrow{ display:none; }
+    .frow .fsize, .frow .farrow, .frow .fengine{ display:none; }
     .hero{ flex-direction: column; align-items: flex-start; }
     .meter{ text-align: left; }
   }
@@ -294,7 +329,7 @@
 
   <div class="hero">
     <div>
-      <p class="hero-title">densitor · batch encoder</p>
+      <p class="hero-title">densitor · batch encoder <span id="appVersionTag" style="color:var(--text-faint); opacity:.7;"></span></p>
       <h1>Comprimi i tuoi JPEG <span class="accent">senza perdere l'occhio</span></h1>
       <p>Ricodifica batch con encoder psicovisivo jpegli — gira interamente nel browser, i file non lasciano mai il tuo dispositivo.</p>
     </div>
@@ -323,6 +358,8 @@
     <div class="dz-sub">oppure clicca per selezionarli — solo .jpg / .jpeg</div>
   </div>
 
+  <div class="warn-banner" id="warnBanner">⚠ Batch grande: la codifica avviene qualche file alla volta per non saturare la memoria del tab — se il browser rallenta o va in crash, prova a ridurre il numero di file per volta.</div>
+
   <div class="filelist" id="fileList"></div>
 
   <div class="actionbar">
@@ -334,6 +371,7 @@
     <b>Motore:</b> jpegli (libjxl) via WebAssembly, encoding progressivo 4:4:4, esecuzione in Web Worker.
     <b>Fallback:</b> se il modulo WASM non si inizializza, si usa l'encoder JPEG nativo del browser sullo stesso file.
     Nessun upload: tutto il lavoro avviene localmente nel tab.
+    <br><span id="appVersionFoot"></span>
   </div>
 
 </div>
@@ -366,6 +404,12 @@ else if (typeof exports === 'object')
 (function(){
   "use strict";
 
+  // Bump this on any behavior/UX change. Mirrored in the HTML comment header
+  // at the top of the file and shown in the UI (title + footer).
+  const APP_VERSION = "1.2.0";
+  document.getElementById('appVersionTag').textContent = 'v' + APP_VERSION;
+  document.getElementById('appVersionFoot').textContent = 'densitor v' + APP_VERSION;
+
   // ---------- quality (0-100) -> jpegli "distance" (libjxl formula) ----------
   function qualityToDistance(q){
     q = Math.max(1, Math.min(100, q));
@@ -381,116 +425,143 @@ else if (typeof exports === 'object')
   }
 
   // ---------- build worker blob (jpegli module source + worker glue) ----------
+  // Memory strategy: the File itself is sent to the worker (cheap structured
+  // clone, no pixel copy). Decode, RGBA->RGB conversion, WASM encode and the
+  // canvas fallback all happen inside the worker, so the main thread never
+  // holds a full pixel buffer — only small File handles and the final
+  // compressed JPEG bytes.
   const jpegliSrc = document.getElementById('jpegli-src').textContent;
   const workerGlue = `
 self.onmessage = async function(e){
-  const { id, rgb, width, height, distance } = e.data;
+  const { id, file, distance, qualityFrac } = e.data;
+  let canvas = null;
   try {
-    const Module = await getJpegliModule();
-    const inPtr = Module._malloc(rgb.length);
-    Module.HEAPU8.set(rgb, inPtr);
-    const outSizePtr = Module._malloc(4);
-    const encode = Module.cwrap('jpegli_wasm_encode_rgb', 'number',
-      ['number','number','number','number','number','number','number']);
-    const outPtr = encode(inPtr, width, height, distance, 2, 1, outSizePtr);
-    if (!outPtr) throw new Error('encode returned null');
-    const outSize = new DataView(Module.HEAPU8.buffer).getUint32(outSizePtr, true);
-    const jpegBytes = Module.HEAPU8.slice(outPtr, outPtr + outSize);
-    Module._jpegli_wasm_free(outPtr);
-    Module._free(inPtr);
-    Module._free(outSizePtr);
-    const out = jpegBytes.slice();
-    self.postMessage({ id: id, ok: true, bytes: out }, [out.buffer]);
+    const bitmap = await createImageBitmap(file);
+    const width = bitmap.width, height = bitmap.height;
+    canvas = new OffscreenCanvas(width, height);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+
+    let bytes, engine;
+    try {
+      const imgData = ctx.getImageData(0, 0, width, height);
+      const rgba = imgData.data;
+      const rgb = new Uint8Array(width * height * 3);
+      for (let i = 0, j = 0; i < rgba.length; i += 4, j += 3){
+        rgb[j] = rgba[i]; rgb[j+1] = rgba[i+1]; rgb[j+2] = rgba[i+2];
+      }
+      const Module = await getJpegliModule();
+      const inPtr = Module._malloc(rgb.length);
+      Module.HEAPU8.set(rgb, inPtr);
+      const outSizePtr = Module._malloc(4);
+      const encode = Module.cwrap('jpegli_wasm_encode_rgb', 'number',
+        ['number','number','number','number','number','number','number']);
+      const outPtr = encode(inPtr, width, height, distance, 2, 1, outSizePtr);
+      if (!outPtr) throw new Error('encode returned null');
+      const outSize = new DataView(Module.HEAPU8.buffer).getUint32(outSizePtr, true);
+      bytes = Module.HEAPU8.slice(outPtr, outPtr + outSize); // single copy out of the wasm heap
+      Module._jpegli_wasm_free(outPtr);
+      Module._free(inPtr);
+      Module._free(outSizePtr);
+      engine = 'jpegli';
+    } catch (werr) {
+      // fallback reuses the already-drawn canvas, no re-decode needed
+      const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: qualityFrac });
+      bytes = new Uint8Array(await blob.arrayBuffer());
+      engine = 'fallback';
+    }
+
+    canvas.width = 0; canvas.height = 0; canvas = null; // release backing store now, don't wait for GC
+    self.postMessage({ id, ok: true, bytes, engine }, [bytes.buffer]);
   } catch (err) {
-    self.postMessage({ id: id, ok: false, error: String(err && err.message || err) });
+    if (canvas){ canvas.width = 0; canvas.height = 0; }
+    self.postMessage({ id, ok: false, error: String(err && err.message || err) });
   }
 };
 let jpegliModulePromise = null;
+let jpegliInitFailed = false;
 function getJpegliModule(){
-  if (!jpegliModulePromise) jpegliModulePromise = JpegliModule();
+  if (jpegliInitFailed) return Promise.reject(new Error('jpegli module previously failed to init'));
+  if (!jpegliModulePromise){
+    jpegliModulePromise = JpegliModule().catch(err => { jpegliInitFailed = true; throw err; });
+  }
   return jpegliModulePromise;
 }
 `;
   const workerBlob = new Blob([jpegliSrc, "\n", workerGlue], { type: "text/javascript" });
   const workerUrl = URL.createObjectURL(workerBlob);
 
-  // ---------- worker pool ----------
+  // ---------- worker pool with periodic recycling ----------
+  // ALLOW_MEMORY_GROWTH means a worker's WASM heap only ever grows within
+  // its lifetime — after it processes one big image it keeps that peak size
+  // even for tiny images afterwards. Killing and respawning the worker every
+  // RECYCLE_EVERY tasks forces the browser to actually reclaim that memory
+  // instead of it becoming a permanent high-water mark for the whole batch.
   const POOL_SIZE = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2)));
+  const RECYCLE_EVERY = 25;
   const pool = [];
-  for (let i = 0; i < POOL_SIZE; i++){
-    pool.push({ worker: new Worker(workerUrl), busy: false });
+  function spawnWorker(slot){
+    const w = new Worker(workerUrl);
+    const entry = pool[slot] || { busy: false, processed: 0 };
+    entry.worker = w;
+    entry.busy = false;
+    entry.processed = 0;
+    wireWorker(entry);
+    pool[slot] = entry;
+    return entry;
   }
-  const pending = new Map(); // id -> {resolve, reject}
-  let msgId = 0;
-
-  pool.forEach(entry => {
+  function wireWorker(entry){
     entry.worker.onmessage = (e) => {
-      const { id, ok, bytes, error } = e.data;
+      const { id, ok, bytes, engine, error } = e.data;
       const p = pending.get(id);
       pending.delete(id);
       entry.busy = false;
-      pumpQueue();
+      entry.processed++;
+      if (entry.processed >= RECYCLE_EVERY){
+        const slot = pool.indexOf(entry);
+        entry.worker.terminate();
+        spawnWorker(slot);
+      }
+      pumpTaskQueue();
       if (!p) return;
-      if (ok) p.resolve(bytes); else p.reject(new Error(error || "encode failed"));
+      if (ok) p.resolve({ bytes, engine }); else p.reject(new Error(error || "encode failed"));
     };
-    entry.worker.onerror = (e) => {
+    entry.worker.onerror = () => {
       entry.busy = false;
-      pumpQueue();
+      pumpTaskQueue();
     };
-  });
+  }
+  for (let i = 0; i < POOL_SIZE; i++) spawnWorker(i);
 
+  const pending = new Map(); // id -> {resolve, reject}
+  let msgId = 0;
   const taskQueue = [];
-  function pumpQueue(){
+  function pumpTaskQueue(){
     if (taskQueue.length === 0) return;
     const free = pool.find(e => !e.busy);
     if (!free) return;
     const task = taskQueue.shift();
     free.busy = true;
     pending.set(task.id, { resolve: task.resolve, reject: task.reject });
-    free.worker.postMessage(task.payload, task.transfer);
-    pumpQueue();
+    free.worker.postMessage(task.payload);
+    pumpTaskQueue();
   }
 
-  function encodeViaWorker(rgb, width, height, distance){
+  function encodeFile(file, distance, qualityFrac){
     return new Promise((resolve, reject) => {
       const id = ++msgId;
       taskQueue.push({
         id,
-        payload: { id, rgb, width, height, distance },
-        transfer: [rgb.buffer],
+        payload: { id, file, distance, qualityFrac },
         resolve, reject
       });
-      pumpQueue();
+      pumpTaskQueue();
     });
   }
 
-  // ---------- fallback: native canvas JPEG encode ----------
-  async function encodeViaCanvasFallback(file, quality){
-    const bitmap = await createImageBitmap(file);
-    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(bitmap, 0, 0);
-    const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: Math.max(0.05, Math.min(1, quality/100)) });
-    return new Uint8Array(await blob.arrayBuffer());
-  }
-
-  // ---------- decode a File to raw RGB ----------
-  async function fileToRGB(file){
-    const bitmap = await createImageBitmap(file);
-    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(bitmap, 0, 0);
-    const imgData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
-    const rgba = imgData.data;
-    const rgb = new Uint8Array(bitmap.width * bitmap.height * 3);
-    for (let i = 0, j = 0; i < rgba.length; i += 4, j += 3){
-      rgb[j] = rgba[i]; rgb[j+1] = rgba[i+1]; rgb[j+2] = rgba[i+2];
-    }
-    return { rgb, width: bitmap.width, height: bitmap.height };
-  }
-
   // ---------- state / UI wiring ----------
-  const state = { items: [], totalSaved: 0 };
+  const state = { items: [], totalSaved: 0, jpegliCount: 0, fallbackCount: 0 };
 
   const dropzone = document.getElementById('dropzone');
   const fileInput = document.getElementById('fileInput');
@@ -502,6 +573,7 @@ function getJpegliModule(){
   const qualitySlider = document.getElementById('qualitySlider');
   const qualityVal = document.getElementById('qualityVal');
   const qualityHint = document.getElementById('qualityHint');
+  const warnBanner = document.getElementById('warnBanner');
 
   function describeQuality(q, d){
     let word;
@@ -542,7 +614,30 @@ function getJpegliModule(){
     return /\.jpe?g$/i.test(file.name) || file.type === "image/jpeg";
   }
 
+  // ---------- item pipeline queue (decode+encode), bounded concurrency ----------
+  // This is the key memory guardrail: only POOL_SIZE items are ever being
+  // decoded/held-in-RAM at once, regardless of how many files were dropped.
+  const itemQueue = [];
+  let activeCount = 0;
+  function scheduleItem(item){
+    itemQueue.push(item);
+    pumpItemQueue();
+  }
+  function pumpItemQueue(){
+    while (activeCount < POOL_SIZE && itemQueue.length > 0){
+      const item = itemQueue.shift();
+      activeCount++;
+      processItem(item).finally(() => {
+        activeCount--;
+        pumpItemQueue();
+      });
+    }
+  }
+
   function addFiles(files){
+    if (state.items.length + files.length > 60){
+      warnBanner.classList.add('show');
+    }
     files.forEach(file => {
       const item = {
         id: "f" + Math.random().toString(36).slice(2),
@@ -551,12 +646,13 @@ function getJpegliModule(){
         originalSize: file.size,
         newSize: null,
         status: "queued", // queued | processing | done | error
+        engine: null, // 'jpegli' | 'fallback'
         row: null,
         resultBytes: null
       };
       state.items.push(item);
       renderRow(item);
-      processItem(item);
+      scheduleItem(item);
     });
     updateStatus();
   }
@@ -569,7 +665,8 @@ function getJpegliModule(){
       <div class="fsize">${fmtBytes(item.originalSize)}</div>
       <div class="farrow">→</div>
       <div class="fnew">—</div>
-      <div class="fpct pending">in coda</div>
+      <div class="fengine pending">in coda</div>
+      <div class="fpct pending">—</div>
       <div class="fstatus-bar idle"><div></div></div>
     `;
     fileList.appendChild(row);
@@ -586,19 +683,29 @@ function getJpegliModule(){
     const bar = row.querySelector('.fstatus-bar');
     const pct = row.querySelector('.fpct');
     const newSizeEl = row.querySelector('.fnew');
+    const engineEl = row.querySelector('.fengine');
     if (item.status === 'processing'){
       bar.classList.remove('idle','error','done');
       bar.querySelector('div').style.width = '55%';
-      pct.textContent = 'in corso'; pct.className = 'fpct pending';
+      pct.textContent = '…'; pct.className = 'fpct pending';
+      engineEl.textContent = 'in corso'; engineEl.className = 'fengine pending';
     } else if (item.status === 'done'){
       bar.classList.remove('idle','error'); bar.classList.add('done');
       newSizeEl.textContent = fmtBytes(item.newSize);
       const delta = 100 * (1 - item.newSize / item.originalSize);
       pct.textContent = (delta >= 0 ? "−" : "+") + Math.abs(delta).toFixed(0) + "%";
       pct.className = 'fpct ' + (delta >= 0 ? 'good' : 'bad');
+      if (item.engine === 'jpegli'){
+        engineEl.textContent = 'jpegli';
+        engineEl.className = 'fengine jpegli';
+      } else {
+        engineEl.textContent = 'fallback';
+        engineEl.className = 'fengine fallback';
+      }
     } else if (item.status === 'error'){
       bar.classList.remove('idle','done'); bar.classList.add('error');
       pct.textContent = 'errore'; pct.className = 'fpct bad';
+      engineEl.textContent = 'fallito'; engineEl.className = 'fengine fallback';
     }
   }
 
@@ -607,14 +714,11 @@ function getJpegliModule(){
     updateRow(item);
     const q = parseInt(qualitySlider.value, 10);
     const distance = qualityToDistance(q);
+    const qualityFrac = Math.max(0.05, Math.min(1, q / 100));
     try {
-      const { rgb, width, height } = await fileToRGB(item.file);
-      let bytes;
-      try {
-        bytes = await encodeViaWorker(rgb, width, height, distance);
-      } catch (werr){
-        bytes = await encodeViaCanvasFallback(item.file, q);
-      }
+      const { bytes, engine } = await encodeFile(item.file, distance, qualityFrac);
+      item.engine = engine;
+      if (engine === 'jpegli') state.jpegliCount++; else state.fallbackCount++;
       item.resultBytes = bytes;
       item.newSize = bytes.byteLength;
       item.status = 'done';
@@ -634,10 +738,15 @@ function getJpegliModule(){
     const processing = state.items.filter(i => i.status === 'processing' || i.status === 'queued').length;
     if (total === 0){
       statusText.innerHTML = 'Nessun file in coda';
-    } else if (processing > 0){
-      statusText.innerHTML = `<span class="hi">${done}/${total}</span> completati` + (errored ? `, ${errored} errori` : '');
     } else {
-      statusText.innerHTML = `<span class="hi">${done}/${total}</span> completati` + (errored ? `, ${errored} errori` : '') + ' — pronto';
+      let engineNote = '';
+      if (state.jpegliCount || state.fallbackCount){
+        engineNote = ` <span style="color:var(--text-faint)">·</span> <span class="hi">${state.jpegliCount}</span> jpegli`;
+        if (state.fallbackCount) engineNote += `, <span class="hi" style="color:var(--amber)">${state.fallbackCount}</span> fallback`;
+      }
+      statusText.innerHTML = `<span class="hi">${done}/${total}</span> completati` +
+        (errored ? `, ${errored} errori` : '') +
+        (processing > 0 ? '' : ' — pronto') + engineNote;
     }
     zipBtn.disabled = done === 0 || processing > 0;
   }
@@ -645,8 +754,12 @@ function getJpegliModule(){
   resetBtn.addEventListener('click', () => {
     state.items = [];
     state.totalSaved = 0;
+    state.jpegliCount = 0;
+    state.fallbackCount = 0;
+    itemQueue.length = 0;
     fileList.innerHTML = '';
     totalSavedEl.textContent = '0 KB';
+    warnBanner.classList.remove('show');
     updateStatus();
   });
 
