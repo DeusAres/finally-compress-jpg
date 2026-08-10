@@ -1,11 +1,14 @@
 <!--
   densitor — batch JPEG compressor (jpegli/WASM)
-  APP VERSION: 1.3.0
+  APP VERSION: 1.4.0
   Bump this + the on-page footer version whenever behavior changes:
     - 1.0.0  initial batch UI, worker pool, ZIP export
     - 1.1.0  per-file engine badge (jpegli/fallback), memory-safe decode queue
     - 1.2.0  decode moved into worker, worker recycling, dropped redundant copy
     - 1.3.0  optional 24MP cap (on by default), in-worker resize before encode
+    - 1.4.0  EXIF/ICC/IPTC/Adobe metadata extracted from source and re-spliced
+             into the re-encoded JPEG; forces imageOrientation:'none' on
+             decode so the copied Orientation tag doesn't double-rotate
 -->
 <!DOCTYPE html>
 <html lang="it">
@@ -428,6 +431,7 @@
     <b>Motore:</b> jpegli (libjxl) via WebAssembly, encoding progressivo 4:4:4, esecuzione in Web Worker.
     <b>Fallback:</b> se il modulo WASM non si inizializza, si usa l'encoder JPEG nativo del browser sullo stesso file.
     Nessun upload: tutto il lavoro avviene localmente nel tab.
+    <b>Metadati:</b> EXIF, GPS, orientamento, profilo ICC e IPTC vengono estratti dal file originale e reinseriti nel JPEG ricodificato.
     <br><span id="appVersionFoot"></span>
   </div>
 
@@ -463,7 +467,7 @@ else if (typeof exports === 'object')
 
   // Bump this on any behavior/UX change. Mirrored in the HTML comment header
   // at the top of the file and shown in the UI (title + footer).
-  const APP_VERSION = "1.3.0";
+  const APP_VERSION = "1.4.0";
   document.getElementById('appVersionTag').textContent = 'v' + APP_VERSION;
   document.getElementById('appVersionFoot').textContent = 'densitor v' + APP_VERSION;
 
@@ -493,7 +497,13 @@ self.onmessage = async function(e){
   const { id, file, distance, qualityFrac, maxPixels } = e.data;
   let canvas = null;
   try {
-    const bitmap = await createImageBitmap(file);
+    const origBytes = new Uint8Array(await file.arrayBuffer());
+    const metaSegments = extractJpegMetadataSegments(origBytes);
+
+    // imageOrientation:'none' forces raw, unrotated pixels regardless of
+    // browser default — required so the EXIF Orientation tag we copy back
+    // afterwards still matches the pixel data (avoids a double rotation).
+    const bitmap = await createImageBitmap(file, { imageOrientation: 'none' });
     let width = bitmap.width, height = bitmap.height;
     let resized = false;
     if (maxPixels && width * height > maxPixels){
@@ -536,13 +546,61 @@ self.onmessage = async function(e){
       engine = 'fallback';
     }
 
+    let metaBytesAdded = 0;
+    if (metaSegments.length){
+      const withMeta = injectJpegMetadataSegments(bytes, metaSegments);
+      metaBytesAdded = withMeta.length - bytes.length;
+      bytes = withMeta;
+    }
+
     canvas.width = 0; canvas.height = 0; canvas = null; // release backing store now, don't wait for GC
-    self.postMessage({ id, ok: true, bytes, engine, resized, width, height }, [bytes.buffer]);
+    self.postMessage({ id, ok: true, bytes, engine, resized, width, height, metaBytesAdded }, [bytes.buffer]);
   } catch (err) {
     if (canvas){ canvas.width = 0; canvas.height = 0; }
     self.postMessage({ id, ok: false, error: String(err && err.message || err) });
   }
 };
+
+// ---------- JPEG metadata (EXIF/ICC/IPTC/Adobe/comment) passthrough ----------
+// Walks the marker segments of the original file and keeps the ones that
+// carry metadata rather than pixel/codec data, so they can be re-spliced
+// into the freshly-encoded JPEG (which starts from a blank slate).
+function extractJpegMetadataSegments(bytes){
+  const segments = [];
+  if (bytes.length < 4 || bytes[0] !== 0xFF || bytes[1] !== 0xD8) return segments;
+  let offset = 2;
+  while (offset + 1 < bytes.length){
+    if (bytes[offset] !== 0xFF) break;
+    const marker = bytes[offset + 1];
+    if (marker === 0xD8 || marker === 0xD9 || marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)){
+      offset += 2; continue;
+    }
+    if (marker === 0xDA) break; // start of scan: pixel data follows, stop here
+    if (offset + 4 > bytes.length) break;
+    const len = (bytes[offset + 2] << 8) | bytes[offset + 3];
+    const segEnd = offset + 2 + len;
+    if (len < 2 || segEnd > bytes.length) break;
+    // APP1 (EXIF/XMP), APP2 (ICC profile), APP13 (Photoshop/IPTC), APP14 (Adobe), COM
+    if (marker === 0xE1 || marker === 0xE2 || marker === 0xED || marker === 0xEE || marker === 0xFE){
+      segments.push(bytes.slice(offset, segEnd));
+    }
+    offset = segEnd;
+  }
+  return segments;
+}
+function injectJpegMetadataSegments(newBytes, segments){
+  if (!segments.length || newBytes.length < 2 || newBytes[0] !== 0xFF || newBytes[1] !== 0xD8) return newBytes;
+  let total = 2;
+  for (const seg of segments) total += seg.length;
+  total += newBytes.length - 2;
+  const out = new Uint8Array(total);
+  out[0] = 0xFF; out[1] = 0xD8;
+  let pos = 2;
+  for (const seg of segments){ out.set(seg, pos); pos += seg.length; }
+  out.set(newBytes.subarray(2), pos);
+  return out;
+}
+
 let jpegliModulePromise = null;
 let jpegliInitFailed = false;
 function getJpegliModule(){
