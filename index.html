@@ -1,21 +1,20 @@
 <!--
   densitor — batch JPEG compressor (jpegli/WASM)
-  APP VERSION: 2.1.0
+  APP VERSION: 2.2.0
   Changelog:
     - 1.x    batch UI, worker pool, ZIP, metadata passthrough, 24MP cap
     - 2.0.0  budget scheduler, SOF-based pricing, runtime B/px calibration,
              resize-on-decode, strip transfer, canvas released before encode
-    - 2.1.0  new jpegli build with the streaming API. Measured on this build
-             (12MP, distance 1.0, prog 2, 4:4:4): the allocation peak is at
-             finish() (~9.7-26.2 B/px), NOT while rows are written (~6.8 B/px).
-             So the canvas is dropped between the last write_rows and finish(),
-             keeping its 4 B/px out of the peak. Total per-image memory:
-               real photos 12.4-15.1 -> 10.7-11.6 B/px
-               synthetic worst 32.8  -> 26.2 B/px
-             Output is byte-identical to the previous buffer API.
-             Calibration now uses jpegli_wasm_heap_size(), which reports
-             allocator usage and so yields a reading on every job rather
-             than only a worker's first one.
+    - 2.1.0  streaming jpegli API; canvas dropped between the last write_rows
+             and finish(), where the allocation peak actually sits
+             (~6.8 B/px during writes vs 9.7-26.2 at finish)
+    - 2.2.0  keep the source file when re-encoding comes out larger. Sources
+             that are already lean (fine quant tables, heavy grain, no chroma
+             subsampling left to reclaim) can grow at visually-lossless
+             settings: measured on a grainy 12.8MP night shot at 0.995 B/px in,
+             break-even sat around quality 91-92 (q95 +16%, q90 -9%).
+             Skipped when the image was downscaled, since then the output is
+             a different image rather than a worse trade.
 -->
 <!DOCTYPE html>
 <html lang="it">
@@ -297,6 +296,7 @@
   .fengine.jpegli{ color: var(--teal); border-color: #5fada44d; background: #5fada41a; }
   .fengine.fallback{ color: var(--amber); border-color: #e6a13c4d; background: #e6a13c1a; }
   .fengine.pending{ color: var(--text-faint); }
+  .fengine.kept{ color: var(--text-dim); border-color: var(--line); background: #ffffff08; }
   .frow .fsize{
     font-family: var(--mono);
     color: var(--text-faint);
@@ -497,7 +497,7 @@ else if (typeof exports === 'object')
 (function(){
   "use strict";
 
-  const APP_VERSION = "2.1.0";
+  const APP_VERSION = "2.2.0";
   document.getElementById('appVersionTag').textContent = 'v' + APP_VERSION;
   document.getElementById('appVersionFoot').textContent = 'densitor v' + APP_VERSION;
 
@@ -783,7 +783,7 @@ function getJpegliModule(){
   }
 
   // ================= UI =================
-  const state = { items: [], totalSaved: 0, jpegliCount: 0, fallbackCount: 0 };
+  const state = { items: [], totalSaved: 0, jpegliCount: 0, fallbackCount: 0, keptCount: 0 };
 
   const dropzone = document.getElementById('dropzone');
   const fileInput = document.getElementById('fileInput');
@@ -846,7 +846,7 @@ function getJpegliModule(){
     files.forEach(file => {
       const item = { id: "f"+Math.random().toString(36).slice(2), file, name: file.name,
                      originalSize: file.size, newSize: null, status: "queued",
-                     engine: null, resized: false, lowMem: false, row: null, resultBytes: null };
+                     engine: null, resized: false, lowMem: false, keptOriginal: false, row: null, resultBytes: null };
       state.items.push(item);
       renderRow(item);
       itemQueue.push(item);
@@ -885,15 +885,22 @@ function getJpegliModule(){
       en.textContent = 'in corso'; en.className = 'fengine pending';
     } else if (item.status === 'done'){
       bar.classList.remove('idle','error'); bar.classList.add('done');
-      const notes = [];
-      if (item.resized) notes.push('ridim.');
-      if (item.lowMem) notes.push('baseline');
-      nw.textContent = fmtBytes(item.newSize) + (notes.length ? ' · ' + notes.join(' · ') : '');
-      const delta = 100 * (1 - item.newSize / item.originalSize);
-      pct.textContent = (delta >= 0 ? "−" : "+") + Math.abs(delta).toFixed(0) + "%";
-      pct.className = 'fpct ' + (delta >= 0 ? 'good' : 'bad');
-      en.textContent = item.engine === 'jpegli' ? 'jpegli' : 'fallback';
-      en.className = 'fengine ' + (item.engine === 'jpegli' ? 'jpegli' : 'fallback');
+      if (item.keptOriginal){
+        nw.textContent = fmtBytes(item.newSize);
+        pct.textContent = 'invariato'; pct.className = 'fpct pending';
+        en.textContent = 'originale'; en.className = 'fengine kept';
+        en.title = 'La ricompressione risultava più pesante: file originale mantenuto intatto';
+      } else {
+        const notes = [];
+        if (item.resized) notes.push('ridim.');
+        if (item.lowMem) notes.push('baseline');
+        nw.textContent = fmtBytes(item.newSize) + (notes.length ? ' · ' + notes.join(' · ') : '');
+        const delta = 100 * (1 - item.newSize / item.originalSize);
+        pct.textContent = (delta >= 0 ? "−" : "+") + Math.abs(delta).toFixed(0) + "%";
+        pct.className = 'fpct ' + (delta >= 0 ? 'good' : 'bad');
+        en.textContent = item.engine === 'jpegli' ? 'jpegli' : 'fallback';
+        en.className = 'fengine ' + (item.engine === 'jpegli' ? 'jpegli' : 'fallback');
+      }
     } else if (item.status === 'error'){
       bar.classList.remove('idle','done'); bar.classList.add('error');
       pct.textContent = 'errore'; pct.className = 'fpct bad';
@@ -937,8 +944,20 @@ function getJpegliModule(){
 
       item.engine = res.engine;
       if (res.engine === 'jpegli') state.jpegliCount++; else state.fallbackCount++;
-      item.resultBytes = res.bytes;
-      item.newSize = res.bytes.byteLength;
+
+      // Already-lean sources (fine quantisation tables, heavy grain, no chroma
+      // subsampling to reclaim) can re-encode larger than they started. A
+      // compressor handing back a bigger file is never the right answer, so
+      // keep the original bytes untouched — metadata and all.
+      if (!item.resized && res.bytes.byteLength >= item.originalSize){
+        item.resultBytes = new Uint8Array(await item.file.arrayBuffer());
+        item.newSize = item.resultBytes.byteLength;
+        item.keptOriginal = true;
+        state.keptCount++;
+      } else {
+        item.resultBytes = res.bytes;
+        item.newSize = res.bytes.byteLength;
+      }
       item.status = 'done';
       state.totalSaved += Math.max(0, item.originalSize - item.newSize);
       totalSavedEl.textContent = fmtBytes(state.totalSaved);
@@ -963,6 +982,7 @@ function getJpegliModule(){
         s += ` <span style="color:var(--text-faint)">·</span> <span class="hi">${state.jpegliCount}</span> jpegli`;
         if (state.fallbackCount) s += `, <span class="hi" style="color:var(--amber)">${state.fallbackCount}</span> fallback`;
       }
+      if (state.keptCount) s += `, <span class="hi">${state.keptCount}</span> invariati`;
       if (observedMaxBpx !== null) s += ` <span style="color:var(--text-faint)">·</span> ${observedMaxBpx.toFixed(1)} B/px`;
       statusText.innerHTML = s;
     }
@@ -990,7 +1010,7 @@ function getJpegliModule(){
 
   resetBtn.addEventListener('click', () => {
     state.items = []; state.totalSaved = 0;
-    state.jpegliCount = 0; state.fallbackCount = 0;
+    state.jpegliCount = 0; state.fallbackCount = 0; state.keptCount = 0;
     itemQueue.length = 0;
     fileList.innerHTML = '';
     totalSavedEl.textContent = '0 KB';
