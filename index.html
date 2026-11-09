@@ -1,6 +1,6 @@
 <!--
   densitor — batch JPEG compressor (jpegli/WASM)
-  APP VERSION: 2.5.0
+  APP VERSION: 2.6.0
   Changelog:
     - 1.x    batch UI, worker pool, ZIP, metadata passthrough, 24MP cap
     - 2.0.0  budget scheduler, SOF-based pricing, runtime B/px calibration,
@@ -17,6 +17,12 @@
              a different image rather than a worse trade.
     - 2.3.0  PNG input (converted to JPEG). Alpha is flattened onto white; the
              keep-original rule is skipped since the source is another format.
+    - 2.6.0  Metadata pass: JPEG header is walked from the File (was capped at the
+             first 256 KB); JFIF density (DPI) re-emitted; Adobe APP14 and MPF/FPXR
+             APP2 dropped (they describe the source encoding, not the re-encode).
+             PNG: pHYs -> DPI, tEXt/zTXt/iTXt keywords -> XMP (Author, Title,
+             Description, Copyright, Software, Creation Time) or JPEG comment,
+             'Raw profile type exif' -> Exif.
     - 2.5.0  PNG whose JPEG conversion comes out larger stays a PNG (same rule as
              2.2.0). Only RGB ICC profiles are re-embedded (gray/CMYK ones would
              mismatch the 3-channel output). Safe createImageBitmap fallback.
@@ -511,7 +517,7 @@ else if (typeof exports === 'object')
 (function(){
   "use strict";
 
-  const APP_VERSION = "2.5.0";
+  const APP_VERSION = "2.6.0";
   document.getElementById('appVersionTag').textContent = 'v' + APP_VERSION;
   document.getElementById('appVersionFoot').textContent = 'densitor v' + APP_VERSION;
 
@@ -588,7 +594,7 @@ self.onmessage = async function(e){
   let canvas = null, ctxPtr = 0, M = null, decodeOpts = null;
   try {
     const isPngSrc = head && head.length > 8 && head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4E && head[3] === 0x47;
-    const metaSegments = keepRgbIccOnly(isPngSrc ? await extractPngMetadataSegments(file) : extractJpegMetadataSegments(head));
+    const metaSegments = keepRgbIccOnly(isPngSrc ? await extractPngMetadataSegments(file) : await extractJpegMetadataSegments(file));
 
     // 'none': keep raw pixel values in the source's own space. The source ICC is
     // re-embedded verbatim, so converting to sRGB here would clip wide-gamut
@@ -706,19 +712,37 @@ async function inflateZlib(bytes){
   const ds = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
   return new Uint8Array(await new Response(ds).arrayBuffer());
 }
+function xmlEsc(t){ return t.split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;'); }
+function hexToBytes(txt){
+  const clean = txt.split(String.fromCharCode(10)).join('').split(' ').join('').split(String.fromCharCode(13)).join('');
+  const out = new Uint8Array(Math.floor(clean.length / 2));
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
+  return out;
+}
+// Text keyword -> XMP property (Dublin Core / xmp). Anything else becomes a JPEG comment.
+const PNG_TEXT_XMP = { 'title': 'dc:title', 'author': 'dc:creator', 'description': 'dc:description',
+                       'copyright': 'dc:rights', 'software': 'xmp:CreatorTool', 'creation time': 'xmp:CreateDate' };
 async function extractPngMetadataSegments(file){
-  const exif = [], xmp = [], icc = [];
+  const exif = [], xmp = [], icc = [], comments = [], texts = [];
+  let jfif = null;
   const MAX_CHUNK = 16 * 1024 * 1024;
+  const latin1 = new TextDecoder('latin1'), utf8 = new TextDecoder('utf-8');
   let o = 8;
   while (o + 12 <= file.size){
     const h = new DataView(await file.slice(o, o + 8).arrayBuffer());
     const len = h.getUint32(0);
     const type = String.fromCharCode(h.getUint8(4), h.getUint8(5), h.getUint8(6), h.getUint8(7));
     if (type === 'IEND') break;
-    if ((type === 'eXIf' || type === 'iCCP' || type === 'iTXt') && len <= MAX_CHUNK){
+    if ((type === 'eXIf' || type === 'iCCP' || type === 'iTXt' || type === 'tEXt' || type === 'zTXt' || type === 'pHYs') && len <= MAX_CHUNK){
       const d = new Uint8Array(await file.slice(o + 8, o + 8 + len).arrayBuffer());
       try {
-        if (type === 'eXIf'){
+        if (type === 'pHYs'){
+          const dv = new DataView(d.buffer, d.byteOffset, d.byteLength);
+          if (d.length >= 9 && d[8] === 1){               // pixels per metre -> JFIF dots per cm
+            const xd = Math.round(dv.getUint32(0) / 100), yd = Math.round(dv.getUint32(4) / 100);
+            if (xd > 0 && yd > 0 && xd < 65536 && yd < 65536) jfif = makeJfif(2, xd, yd);
+          }
+        } else if (type === 'eXIf'){
           const seg = makeAppSegment(0xE1, [asciiBytes('Exif'), new Uint8Array([0, 0]), d]);
           if (seg) exif.push(seg);
         } else if (type === 'iCCP'){
@@ -734,23 +758,66 @@ async function extractPngMetadataSegments(file){
             }
           }
         } else {
+          // tEXt / zTXt / iTXt: keyword NUL ...
           const z = d.indexOf(0);
-          if (z > 0 && String.fromCharCode(...d.subarray(0, z)) === 'XML:com.adobe.xmp'){
-            const compressed = d[z + 1] === 1;
-            let p = z + 3;                                  // skip flag + method
-            p = d.indexOf(0, p) + 1;                        // language tag
-            p = d.indexOf(0, p) + 1;                        // translated keyword
-            let text = d.subarray(p);
-            if (compressed) text = await inflateZlib(text);
-            const seg = makeAppSegment(0xE1, [asciiBytes('http://ns.adobe.com/xap/1.0/'), new Uint8Array([0]), text]);
-            if (seg) xmp.push(seg);
+          if (z > 0){
+            const key = latin1.decode(d.subarray(0, z));
+            let value;
+            if (type === 'tEXt') value = latin1.decode(d.subarray(z + 1));
+            else if (type === 'zTXt') value = latin1.decode(await inflateZlib(d.subarray(z + 2)));
+            else {
+              const compressed = d[z + 1] === 1;
+              let p = z + 3;                                  // skip flag + method
+              p = d.indexOf(0, p) + 1;                        // language tag
+              p = d.indexOf(0, p) + 1;                        // translated keyword
+              let body = d.subarray(p);
+              if (compressed) body = await inflateZlib(body);
+              if (key === 'XML:com.adobe.xmp'){
+                const seg = makeAppSegment(0xE1, [asciiBytes('http://ns.adobe.com/xap/1.0/'), new Uint8Array([0]), body]);
+                if (seg) xmp.push(seg);
+                value = null;
+              } else value = utf8.decode(body);
+            }
+            if (value !== null && value !== undefined){
+              const lk = key.toLowerCase();
+              if (lk === 'raw profile type exif' || lk === 'raw profile type app1'){
+                // ImageMagick/exiftool style: newline, name, newline, length, hex dump
+                const lines = value.split(String.fromCharCode(10)).filter(l => l.length);
+                const bytes = hexToBytes(lines.slice(2).join(''));
+                const hasHdr = bytes.length > 6 && bytes[0] === 0x45 && bytes[1] === 0x78 && bytes[2] === 0x69 && bytes[3] === 0x66;
+                const seg = makeAppSegment(0xE1, hasHdr ? [bytes] : [asciiBytes('Exif'), new Uint8Array([0, 0]), bytes]);
+                if (seg && !exif.length) exif.push(seg);
+              } else if (lk.indexOf('raw profile type') === 0) {
+                /* other raw profiles (icc, iptc, xmp): not translated */
+              } else if (PNG_TEXT_XMP[lk]) {
+                texts.push([PNG_TEXT_XMP[lk], value]);
+              } else {
+                const seg = makeAppSegment(0xFE, [new TextEncoder().encode(key + ': ' + value)]);
+                if (seg) comments.push(seg);
+              }
+            }
           }
         }
       } catch (_) { /* malformed chunk: skip it, keep the rest */ }
     }
     o += 12 + len;
   }
-  return exif.concat(xmp, icc);
+  // No real XMP in the file: synthesise one from the well-known text keywords.
+  if (!xmp.length && texts.length){
+    const body = texts.map(t => {
+      const tag = t[0], v = xmlEsc(t[1]);
+      if (tag === 'dc:title' || tag === 'dc:description' || tag === 'dc:rights')
+        return '<' + tag + '><rdf:Alt><rdf:li xml:lang="x-default">' + v + '</rdf:li></rdf:Alt></' + tag + '>';
+      if (tag === 'dc:creator') return '<dc:creator><rdf:Seq><rdf:li>' + v + '</rdf:li></rdf:Seq></dc:creator>';
+      return '<' + tag + '>' + v + '</' + tag + '>';
+    }).join('');
+    const packet = '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">' +
+      '<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:xmp="http://ns.adobe.com/xap/1.0/">' +
+      body + '</rdf:Description></rdf:RDF></x:xmpmeta>';
+    const seg = makeAppSegment(0xE1, [asciiBytes('http://ns.adobe.com/xap/1.0/'), new Uint8Array([0]), new TextEncoder().encode(packet)]);
+    if (seg) xmp.push(seg);
+  }
+  return (jfif ? [jfif] : []).concat(exif, xmp, icc, comments);
 }
 
 function qualityFracOf(distance){
@@ -758,23 +825,42 @@ function qualityFracOf(distance){
   return Math.max(0.05, Math.min(1, q / 100));
 }
 
-function extractJpegMetadataSegments(bytes){
-  const segments = [];
-  if (!bytes || bytes.length < 4 || bytes[0] !== 0xFF || bytes[1] !== 0xD8) return segments;
+// Walks the JPEG header straight from the File (no 256 KB cap) and keeps:
+// EXIF/XMP (APP1), ICC (APP2, ICC_PROFILE only: MPF/FPXR offsets would dangle),
+// Photoshop/IPTC (APP13), comments, and the JFIF density (re-emitted as APP0).
+// Adobe APP14 is dropped on purpose: its colour-transform flag describes the
+// source encoding, and copying it onto a YCbCr re-encode skews the colours.
+async function extractJpegMetadataSegments(file){
+  const segments = []; let jfif = null;
+  const size = file.size;
   let o = 2;
-  while (o + 1 < bytes.length){
-    if (bytes[o] !== 0xFF) break;
-    const m = bytes[o+1];
+  while (o + 4 <= size){
+    const h = new Uint8Array(await file.slice(o, o + 4).arrayBuffer());
+    if (h[0] !== 0xFF) break;
+    const m = h[1];
+    if (m === 0xFF){ o += 1; continue; }
     if (m === 0xD8 || m === 0x01 || (m >= 0xD0 && m <= 0xD7)){ o += 2; continue; }
     if (m === 0xD9 || m === 0xDA) break;
-    if (o + 4 > bytes.length) break;
-    const len = (bytes[o+2] << 8) | bytes[o+3];
-    const end = o + 2 + len;
-    if (len < 2 || end > bytes.length) break;
-    if (m === 0xE1 || m === 0xE2 || m === 0xED || m === 0xEE || m === 0xFE) segments.push(bytes.slice(o, end));
-    o = end;
+    const len = (h[2] << 8) | h[3];
+    if (len < 2 || o + 2 + len > size) break;
+    if (m === 0xE0 || m === 0xE1 || m === 0xE2 || m === 0xED || m === 0xFE){
+      const seg = new Uint8Array(await file.slice(o, o + 2 + len).arrayBuffer());
+      if (m === 0xE0){
+        // JFIF: 'JFIF' NUL, version(2), units, Xdensity(2), Ydensity(2)
+        if (seg.length >= 16 && seg[4] === 0x4A && seg[5] === 0x46 && seg[6] === 0x49 && seg[7] === 0x46 && (seg[11] === 1 || seg[11] === 2)){
+          jfif = makeJfif(seg[11], (seg[12] << 8) | seg[13], (seg[14] << 8) | seg[15]);
+        }
+      } else if (m === 0xE2){
+        if (seg.length > 18 && seg[4] === 0x49 && seg[5] === 0x43 && seg[6] === 0x43) segments.push(seg);   // ICC_PROFILE
+      } else segments.push(seg);
+    }
+    o += 2 + len;
   }
+  if (jfif) segments.unshift(jfif);
   return segments;
+}
+function makeJfif(units, xd, yd){
+  return new Uint8Array([0xFF, 0xE0, 0, 16, 0x4A, 0x46, 0x49, 0x46, 0, 1, 1, units, xd >> 8, xd & 255, yd >> 8, yd & 255, 0, 0]);
 }
 function injectJpegMetadataSegments(newBytes, segments){
   if (!segments.length || newBytes.length < 2 || newBytes[0] !== 0xFF || newBytes[1] !== 0xD8) return newBytes;
