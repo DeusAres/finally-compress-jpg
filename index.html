@@ -818,12 +818,38 @@ function getJpegliModule(){
 
   dropzone.addEventListener('click', () => fileInput.click());
   dropzone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') fileInput.click(); });
-  ['dragenter','dragover'].forEach(ev => dropzone.addEventListener(ev, e => { e.preventDefault(); dropzone.classList.add('drag'); }));
-  ['dragleave','drop'].forEach(ev => dropzone.addEventListener(ev, e => { e.preventDefault(); dropzone.classList.remove('drag'); }));
+  fileInput.addEventListener('click', e => e.stopPropagation()); // evita il re-bubbling verso il dropzone
+
+  // Drag & drop: contatore enter/leave (dragleave scatta anche sui figli → flicker)
+  const hasFiles = e => e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+  let dragDepth = 0;
+  const setDrag = on => dropzone.classList.toggle('drag', on);
+
+  dropzone.addEventListener('dragenter', e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault(); dragDepth++; setDrag(true);
+  });
+  dropzone.addEventListener('dragover', e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; setDrag(true);
+  });
+  dropzone.addEventListener('dragleave', e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault(); dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) setDrag(false);
+  });
   dropzone.addEventListener('drop', e => {
+    e.preventDefault(); e.stopPropagation();
+    dragDepth = 0; setDrag(false);
     const f = Array.from(e.dataTransfer.files || []).filter(isJpeg);
     if (f.length) addFiles(f);
   });
+  // Drop fuori dal dropzone: impedisce al browser di aprire/navigare al file
+  ['dragover','drop'].forEach(ev => window.addEventListener(ev, e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    if (!dropzone.contains(e.target)) e.dataTransfer.dropEffect = 'none';
+  }));
+  window.addEventListener('dragend', () => { dragDepth = 0; setDrag(false); });
   fileInput.addEventListener('change', () => {
     const f = Array.from(fileInput.files || []).filter(isJpeg);
     if (f.length) addFiles(f);
