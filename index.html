@@ -1,6 +1,6 @@
 <!--
   densitor — batch JPEG compressor (jpegli/WASM)
-  APP VERSION: 2.4.0
+  APP VERSION: 2.5.0
   Changelog:
     - 1.x    batch UI, worker pool, ZIP, metadata passthrough, 24MP cap
     - 2.0.0  budget scheduler, SOF-based pricing, runtime B/px calibration,
@@ -17,6 +17,11 @@
              a different image rather than a worse trade.
     - 2.3.0  PNG input (converted to JPEG). Alpha is flattened onto white; the
              keep-original rule is skipped since the source is another format.
+    - 2.5.0  PNG whose JPEG conversion comes out larger stays a PNG (same rule as
+             2.2.0). Only RGB ICC profiles are re-embedded (gray/CMYK ones would
+             mismatch the 3-channel output). Safe createImageBitmap fallback.
+             Version check against the live index.html forces a reload when the
+             cached copy is stale (iOS Safari).
     - 2.4.0  PNG eXIf / XMP (iTXt) / ICC (iCCP) carried over as JPEG APPn.
              Decode with colorSpaceConversion:'none': the source ICC is
              re-embedded verbatim, so converting to sRGB first clipped
@@ -27,6 +32,9 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
 <title>densitor — compressione JPEG batch</title>
 <style>
   :root{
@@ -503,9 +511,28 @@ else if (typeof exports === 'object')
 (function(){
   "use strict";
 
-  const APP_VERSION = "2.4.0";
+  const APP_VERSION = "2.5.0";
   document.getElementById('appVersionTag').textContent = 'v' + APP_VERSION;
   document.getElementById('appVersionFoot').textContent = 'densitor v' + APP_VERSION;
+
+  // iOS Safari (and home-screen web apps) keep serving a stale index.html and ignore
+  // the cache meta tags. Ask the server for the live copy; if its version differs,
+  // reload once with a cache-busting query. sessionStorage guards against loops.
+  (async function checkForNewVersion(){
+    try {
+      if (location.protocol === 'file:') return;
+      const res = await fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' });
+      if (!res.ok) return;
+      const m = /const APP_VERSION = "([^"]+)"/.exec(await res.text());
+      if (!m || m[1] === APP_VERSION) { try { sessionStorage.removeItem('densitor-reload'); } catch(_){} return; }
+      let tried = null;
+      try { tried = sessionStorage.getItem('densitor-reload'); } catch(_){}
+      if (tried === m[1]) return;                       // already reloaded for this version
+      try { sessionStorage.setItem('densitor-reload', m[1]); } catch(_){}
+      const u = new URL(location.href); u.searchParams.set('v', m[1]);
+      location.replace(u.toString());
+    } catch (_) { /* offline or blocked: keep running the loaded copy */ }
+  })();
 
   function qualityToDistance(q){
     q = Math.max(1, Math.min(100, q));
@@ -561,14 +588,14 @@ self.onmessage = async function(e){
   let canvas = null, ctxPtr = 0, M = null, decodeOpts = null;
   try {
     const isPngSrc = head && head.length > 8 && head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4E && head[3] === 0x47;
-    const metaSegments = isPngSrc ? await extractPngMetadataSegments(file) : extractJpegMetadataSegments(head);
+    const metaSegments = keepRgbIccOnly(isPngSrc ? await extractPngMetadataSegments(file) : extractJpegMetadataSegments(head));
 
     // 'none': keep raw pixel values in the source's own space. The source ICC is
     // re-embedded verbatim, so converting to sRGB here would clip wide-gamut
     // (P3) colours and then tag the clipped values with the wrong profile.
     decodeOpts = { imageOrientation: 'none', colorSpaceConversion: 'none' };
     if (targetW) { decodeOpts.resizeWidth = targetW; decodeOpts.resizeHeight = targetH; decodeOpts.resizeQuality = 'high'; }
-    const bitmap = await createImageBitmap(file, decodeOpts);
+    const bitmap = await decodeBitmap(file, decodeOpts);
     const width = bitmap.width, height = bitmap.height;
     canvas = new OffscreenCanvas(width, height);
     let ctx2d = canvas.getContext('2d');
@@ -624,7 +651,7 @@ self.onmessage = async function(e){
     } catch (werr) {
       if (ctxPtr && M && M._jpegli_wasm_abort){ try { M._jpegli_wasm_abort(ctxPtr); } catch(_){} ctxPtr = 0; }
       if (!canvas){
-        const bm2 = await createImageBitmap(file, decodeOpts);
+        const bm2 = await decodeBitmap(file, decodeOpts);
         canvas = new OffscreenCanvas(bm2.width, bm2.height);
         const c2 = canvas.getContext('2d');
         c2.fillStyle = '#fff'; c2.fillRect(0, 0, bm2.width, bm2.height);
@@ -651,6 +678,21 @@ self.onmessage = async function(e){
 // PNG -> JPEG metadata: eXIf -> APP1 Exif, iTXt XMP -> APP1 XMP, iCCP -> APP2 ICC_PROFILE.
 // Chunks are walked via small slices (IDAT payloads are skipped, never read), so
 // metadata placed after the pixel data (typical for eXIf) is found too.
+function keepRgbIccOnly(segs){
+  // ICC_PROFILE chunk 1: FF E2 len(2) ICC_PROFILE+NUL (12 bytes), seq, total, then the profile; colour space sits at profile offset 16.
+  const isIcc = s => s[1] === 0xE2 && s.length > 38 && s[4] === 0x49 && s[5] === 0x43 && s[6] === 0x43;
+  const first = segs.find(s => isIcc(s) && s[16] === 1);
+  if (!first) return segs.filter(s => !isIcc(s));
+  const cs = String.fromCharCode(first[34], first[35], first[36], first[37]);
+  return cs === 'RGB ' ? segs : segs.filter(s => !isIcc(s));
+}
+async function decodeBitmap(file, opts){
+  try { return await createImageBitmap(file, opts); }
+  catch (e) {
+    const o2 = Object.assign({}, opts); delete o2.colorSpaceConversion;
+    return await createImageBitmap(file, o2);
+  }
+}
 function asciiBytes(str){ const a = new Uint8Array(str.length); for (let i = 0; i < str.length; i++) a[i] = str.charCodeAt(i); return a; }
 function makeAppSegment(marker, parts){
   let n = 0; for (const p of parts) n += p.length;
@@ -998,7 +1040,7 @@ function getJpegliModule(){
         nw.textContent = fmtBytes(item.newSize);
         pct.textContent = 'invariato'; pct.className = 'fpct pending';
         en.textContent = 'originale'; en.className = 'fengine kept';
-        en.title = 'La ricompressione risultava più pesante: file originale mantenuto intatto';
+        en.title = 'La conversione risultava più pesante: file originale mantenuto intatto (i PNG restano PNG)';
       } else {
         const notes = [];
         if (item.resized) notes.push('ridim.');
@@ -1058,7 +1100,7 @@ function getJpegliModule(){
       // subsampling to reclaim) can re-encode larger than they started. A
       // compressor handing back a bigger file is never the right answer, so
       // keep the original bytes untouched — metadata and all.
-      if (!item.isPng && !item.resized && res.bytes.byteLength >= item.originalSize){
+      if (!item.resized && res.bytes.byteLength >= item.originalSize){
         item.resultBytes = new Uint8Array(await item.file.arrayBuffer());
         item.newSize = item.resultBytes.byteLength;
         item.keptOriginal = true;
@@ -1102,9 +1144,10 @@ function getJpegliModule(){
   function computeUniqueNames(items){
     const used = new Set();
     return items.map(item => {
-      const base = item.name.replace(/\.(jpe?g|png)$/i, '') + '.jpg';
+      const ext = (item.keptOriginal && item.isPng) ? 'png' : 'jpg';   // a kept PNG stays a PNG
+      const base = item.name.replace(/\.(jpe?g|png)$/i, '') + '.' + ext;
       let f = base, n = 1;
-      while (used.has(f)){ f = base.replace(/\.jpg$/, `-${n}.jpg`); n++; }
+      while (used.has(f)){ f = base.replace(/\.[a-z]+$/, `-${n}.${ext}`); n++; }
       used.add(f);
       return { item, filename: f };
     });
@@ -1149,7 +1192,7 @@ function getJpegliModule(){
     const named = computeUniqueNames(done);
     for (let i = 0; i < named.length; i++){
       dlAllBtn.textContent = `Scarico ${i+1}/${named.length}…`;
-      triggerDownload(new Blob([named[i].item.resultBytes], { type: 'image/jpeg' }), named[i].filename);
+      triggerDownload(new Blob([named[i].item.resultBytes], { type: (named[i].item.keptOriginal && named[i].item.isPng) ? 'image/png' : 'image/jpeg' }), named[i].filename);
       if (i < named.length - 1) await new Promise(r => setTimeout(r, 250));
     }
     dlAllBtn.textContent = 'Scarica singoli';
