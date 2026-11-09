@@ -17,6 +17,7 @@
              a different image rather than a worse trade.
     - 2.3.0  PNG input (converted to JPEG). Alpha is flattened onto white; the
              keep-original rule is skipped since the source is another format.
+             PNG eXIf / XMP (iTXt) / ICC (iCCP) are carried over as JPEG APPn.
 -->
 <!DOCTYPE html>
 <html lang="it">
@@ -556,7 +557,8 @@ self.onmessage = async function(e){
   const { id, file, head, distance, progressive, chroma444, targetW, targetH } = e.data;
   let canvas = null, ctxPtr = 0, M = null, decodeOpts = null;
   try {
-    const metaSegments = extractJpegMetadataSegments(head);
+    const isPngSrc = head && head.length > 8 && head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4E && head[3] === 0x47;
+    const metaSegments = isPngSrc ? await extractPngMetadataSegments(file) : extractJpegMetadataSegments(head);
 
     decodeOpts = { imageOrientation: 'none' };
     if (targetW) { decodeOpts.resizeWidth = targetW; decodeOpts.resizeHeight = targetH; decodeOpts.resizeQuality = 'high'; }
@@ -639,6 +641,69 @@ self.onmessage = async function(e){
     self.postMessage({ id, ok: false, error: String(err && err.message || err) });
   }
 };
+
+// PNG -> JPEG metadata: eXIf -> APP1 Exif, iTXt XMP -> APP1 XMP, iCCP -> APP2 ICC_PROFILE.
+// Chunks are walked via small slices (IDAT payloads are skipped, never read), so
+// metadata placed after the pixel data (typical for eXIf) is found too.
+function asciiBytes(str){ const a = new Uint8Array(str.length); for (let i = 0; i < str.length; i++) a[i] = str.charCodeAt(i); return a; }
+function makeAppSegment(marker, parts){
+  let n = 0; for (const p of parts) n += p.length;
+  if (n + 2 > 65535) return null;
+  const out = new Uint8Array(n + 4);
+  out[0] = 0xFF; out[1] = marker; out[2] = (n + 2) >> 8; out[3] = (n + 2) & 255;
+  let o = 4; for (const p of parts){ out.set(p, o); o += p.length; }
+  return out;
+}
+async function inflateZlib(bytes){
+  const ds = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+  return new Uint8Array(await new Response(ds).arrayBuffer());
+}
+async function extractPngMetadataSegments(file){
+  const exif = [], xmp = [], icc = [];
+  const MAX_CHUNK = 16 * 1024 * 1024;
+  let o = 8;
+  while (o + 12 <= file.size){
+    const h = new DataView(await file.slice(o, o + 8).arrayBuffer());
+    const len = h.getUint32(0);
+    const type = String.fromCharCode(h.getUint8(4), h.getUint8(5), h.getUint8(6), h.getUint8(7));
+    if (type === 'IEND') break;
+    if ((type === 'eXIf' || type === 'iCCP' || type === 'iTXt') && len <= MAX_CHUNK){
+      const d = new Uint8Array(await file.slice(o + 8, o + 8 + len).arrayBuffer());
+      try {
+        if (type === 'eXIf'){
+          const seg = makeAppSegment(0xE1, [asciiBytes('Exif'), new Uint8Array([0, 0]), d]);
+          if (seg) exif.push(seg);
+        } else if (type === 'iCCP'){
+          const z = d.indexOf(0);
+          if (z > 0 && d[z + 1] === 0){
+            const prof = await inflateZlib(d.subarray(z + 2));
+            const CH = 65519, total = Math.ceil(prof.length / CH);
+            if (total > 0 && total < 256){
+              for (let i = 0; i < total; i++){
+                const seg = makeAppSegment(0xE2, [asciiBytes('ICC_PROFILE'), new Uint8Array([0, i + 1, total]), prof.subarray(i * CH, (i + 1) * CH)]);
+                if (seg) icc.push(seg);
+              }
+            }
+          }
+        } else {
+          const z = d.indexOf(0);
+          if (z > 0 && String.fromCharCode(...d.subarray(0, z)) === 'XML:com.adobe.xmp'){
+            const compressed = d[z + 1] === 1;
+            let p = z + 3;                                  // skip flag + method
+            p = d.indexOf(0, p) + 1;                        // language tag
+            p = d.indexOf(0, p) + 1;                        // translated keyword
+            let text = d.subarray(p);
+            if (compressed) text = await inflateZlib(text);
+            const seg = makeAppSegment(0xE1, [asciiBytes('http://ns.adobe.com/xap/1.0/'), new Uint8Array([0]), text]);
+            if (seg) xmp.push(seg);
+          }
+        }
+      } catch (_) { /* malformed chunk: skip it, keep the rest */ }
+    }
+    o += 12 + len;
+  }
+  return exif.concat(xmp, icc);
+}
 
 function qualityFracOf(distance){
   const q = distance <= 0 ? 100 : (distance >= 0.1 ? 100 - (distance - 0.1) / 0.09 : 100);
