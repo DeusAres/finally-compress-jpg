@@ -1,6 +1,6 @@
 <!--
   densitor — batch JPEG compressor (jpegli/WASM)
-  APP VERSION: 2.3.0
+  APP VERSION: 2.4.0
   Changelog:
     - 1.x    batch UI, worker pool, ZIP, metadata passthrough, 24MP cap
     - 2.0.0  budget scheduler, SOF-based pricing, runtime B/px calibration,
@@ -17,7 +17,10 @@
              a different image rather than a worse trade.
     - 2.3.0  PNG input (converted to JPEG). Alpha is flattened onto white; the
              keep-original rule is skipped since the source is another format.
-             PNG eXIf / XMP (iTXt) / ICC (iCCP) are carried over as JPEG APPn.
+    - 2.4.0  PNG eXIf / XMP (iTXt) / ICC (iCCP) carried over as JPEG APPn.
+             Decode with colorSpaceConversion:'none': the source ICC is
+             re-embedded verbatim, so converting to sRGB first clipped
+             wide-gamut (P3) colours and then mis-tagged them.
 -->
 <!DOCTYPE html>
 <html lang="it">
@@ -500,7 +503,7 @@ else if (typeof exports === 'object')
 (function(){
   "use strict";
 
-  const APP_VERSION = "2.3.0";
+  const APP_VERSION = "2.4.0";
   document.getElementById('appVersionTag').textContent = 'v' + APP_VERSION;
   document.getElementById('appVersionFoot').textContent = 'densitor v' + APP_VERSION;
 
